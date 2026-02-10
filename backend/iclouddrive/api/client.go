@@ -17,8 +17,8 @@ import (
 
 const (
 	baseEndpoint  = "https://www.icloud.com"
-	homeEndpoint  = "https://www.icloud.com"
 	setupEndpoint = "https://setup.icloud.com/setup/ws/1"
+	idmsaEndpoint = "https://idmsa.apple.com"
 	authEndpoint  = "https://idmsa.apple.com/appleauth/auth"
 )
 
@@ -117,7 +117,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	}
 
 	fs.Debugf("icloud", "Authenticating as %s\n", c.appleID)
-	err := c.Session.SignIn(ctx, c.appleID, c.password)
+	err := c.SignIn(ctx)
 
 	if err == nil {
 		err = c.Session.AuthWithToken(ctx)
@@ -130,7 +130,19 @@ func (c *Client) Authenticate(ctx context.Context) error {
 
 // SignIn signs in the client using the provided context and credentials.
 func (c *Client) SignIn(ctx context.Context) error {
-	return c.Session.SignIn(ctx, c.appleID, c.password)
+	if err := c.Session.SignIn(ctx); err != nil {
+		return err
+	}
+	proof, err := c.Session.SignInInit(ctx, c.appleID, c.password)
+	if err != nil {
+		return err
+	}
+	res, err := c.Session.SignInComplete(ctx, c.appleID, *proof)
+	if err != nil {
+		return err
+	}
+	_ = res
+	return nil
 }
 
 // IntoReader marshals the provided values into a JSON encoded reader
