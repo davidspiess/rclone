@@ -2,6 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/pbkdf2"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"net/http"
@@ -10,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/rclone/rclone/backend/iclouddrive/srp"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -25,7 +30,8 @@ type Session struct {
 	Cookies        []*http.Cookie `json:"cookies"`
 	AccountInfo    AccountInfo    `json:"account_info"`
 
-	srv *rest.Client `json:"-"`
+	authAttributes string       `json:"-"`
+	srv            *rest.Client `json:"-"`
 }
 
 // String returns the session as a string
@@ -37,11 +43,24 @@ type Session struct {
 // Request makes a request
 func (s *Session) Request(ctx context.Context, opts rest.Opts, request any, response any) (*http.Response, error) {
 	resp, err := s.srv.CallJSON(ctx, &opts, &request, &response)
-
 	if err != nil {
 		return resp, err
 	}
+	s.storeHeaderValues(resp)
+	return resp, nil
+}
 
+// Call makes the call and returns the http.Response
+func (s *Session) Call(ctx context.Context, opts rest.Opts) (*http.Response, error) {
+	resp, err := s.srv.Call(ctx, &opts)
+	if err != nil {
+		return resp, err
+	}
+	s.storeHeaderValues(resp)
+	return resp, nil
+}
+
+func (s *Session) storeHeaderValues(resp *http.Response) {
 	if val := resp.Header.Get("X-Apple-ID-Account-Country"); val != "" {
 		s.AccountCountry = val
 	}
@@ -54,11 +73,12 @@ func (s *Session) Request(ctx context.Context, opts rest.Opts, request any, resp
 	if val := resp.Header.Get("X-Apple-TwoSV-Trust-Token"); val != "" {
 		s.TrustToken = val
 	}
+	if val := resp.Header.Get("X-Apple-Auth-Attributes"); val != "" {
+		s.authAttributes = val
+	}
 	if val := resp.Header.Get("scnt"); val != "" {
 		s.Scnt = val
 	}
-
-	return resp, nil
 }
 
 // Requires2FA returns true if the session requires 2FA
@@ -67,36 +87,131 @@ func (s *Session) Requires2FA() bool {
 }
 
 // SignIn signs in the session
-func (s *Session) SignIn(ctx context.Context, appleID, password string) error {
-	trustTokens := []string{}
-	if s.TrustToken != "" {
-		trustTokens = []string{s.TrustToken}
-	}
-	values := map[string]any{
-		"accountName": appleID,
-		"password":    password,
-		"rememberMe":  true,
-		"trustTokens": trustTokens,
-	}
-	body, err := IntoReader(values)
-	if err != nil {
-		return err
-	}
+func (s *Session) SignIn(ctx context.Context) error {
+	headers := s.GetAuthHeaders(map[string]string{})
+
 	opts := rest.Opts{
-		Method:       "POST",
-		Path:         "/signin",
-		Parameters:   url.Values{},
-		ExtraHeaders: s.GetAuthHeaders(map[string]string{}),
-		RootURL:      authEndpoint,
-		IgnoreStatus: true, // need to handle 409 for hsa2
-		NoResponse:   true,
-		Body:         body,
+		Method: "GET",
+		Path:   "/authorize/signin",
+		Parameters: url.Values{
+			"frame_id":      {headers["X-Apple-OAuth-State"]},
+			"skVersion":     {"7"},
+			"iframeId":      {headers["X-Apple-OAuth-State"]},
+			"client_id":     {headers["X-Apple-Widget-Key"]},
+			"response_type": {headers["X-Apple-OAuth-Response-Type"]},
+			"redirect_uri":  {headers["X-Apple-OAuth-Redirect-URI"]},
+			"response_mode": {headers["X-Apple-OAuth-Response-Mode"]},
+			"state":         {headers["X-Apple-OAuth-State"]},
+			"authVersion":   {"latest"},
+		},
+		RootURL: authEndpoint,
 	}
-	opts.Parameters.Set("isRememberMeEnabled", "true")
-	_, err = s.Request(ctx, opts, nil, nil)
+	resp, err := s.Call(ctx, opts)
+	if err == nil {
+		s.Cookies = resp.Cookies()
+	}
 
 	return err
+}
 
+func (s *Session) SignInInit(ctx context.Context, appleID, password string) (*SignInProof, error) {
+	params := srp.GetParams(2048)
+	params.NoUserNameInX = true // this is required for Apple's implementation
+
+	client := srp.NewSRPClient(params, nil)
+	values := map[string]any{
+		"a":           base64.StdEncoding.EncodeToString(client.GetABytes()),
+		"accountName": appleID,
+		"protocols":   []SignInProtocol{SignInProtocolS2K, SignInProtocolS2KFO},
+	}
+
+	body, err := IntoReader(values)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := rest.Opts{
+		Method:       "POST",
+		Path:         "/signin/init",
+		ExtraHeaders: s.GetAuthHeaders(map[string]string{}),
+		RootURL:      authEndpoint,
+		Body:         body,
+	}
+
+	var responseInfo *SignInInitResponse
+	_, err = s.Request(ctx, opts, nil, &responseInfo)
+	if err != nil {
+		return nil, err
+	}
+	if !responseInfo.Protocol.Valid() {
+		return nil, fmt.Errorf("unsupported signin protocol: %q", responseInfo.Protocol)
+	}
+
+	salt, err := base64.StdEncoding.DecodeString(responseInfo.Salt)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := base64.StdEncoding.DecodeString(responseInfo.B)
+	if err != nil {
+		return nil, err
+	}
+
+	encodedPassword, err := responseInfo.Protocol.EncodePassword(password)
+	if err != nil {
+		return nil, err
+	}
+
+	srpPassword, err := pbkdf2.Key(sha256.New, string(encodedPassword), salt, responseInfo.Iteration, 32)
+	if err != nil {
+		return nil, err
+	}
+
+	client.ProcessClientChallange([]byte(appleID), srpPassword, salt, b)
+
+	return &SignInProof{
+		C:  responseInfo.C,
+		M1: client.M1,
+		M2: client.M2,
+	}, nil
+}
+
+// SignInComplete completes the sign-in process.
+func (s *Session) SignInComplete(ctx context.Context, appleID string, proof SignInProof) (*http.Response, error) {
+	values := map[string]any{
+		"accountName": appleID,
+		"c":           proof.C,
+		"m1":          base64.StdEncoding.EncodeToString(proof.M1),
+		"m2":          base64.StdEncoding.EncodeToString(proof.M2),
+		"rememberMe":  true,
+		"trustTokens": []string{},
+	}
+
+	body, err := IntoReader(values)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/signin/complete",
+		Parameters: url.Values{
+			"isRememberMeEnabled": {"true"},
+		},
+		ExtraHeaders: s.GetAuthHeaders(map[string]string{
+			"scnt":                    s.Scnt,
+			"X-Apple-ID-Session-Id":   s.SessionID,
+			"X-Apple-Auth-Attributes": s.authAttributes,
+		}),
+		RootURL: authEndpoint,
+		Body:    body,
+	}
+
+	resp, err := s.Request(ctx, opts, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp, err
 }
 
 // AuthWithToken authenticates the session
@@ -206,7 +321,7 @@ func (s *Session) ValidateSession(ctx context.Context) error {
 // overwriting the default headers. It returns a map[string]string.
 func (s *Session) GetAuthHeaders(overwrite map[string]string) map[string]string {
 	headers := map[string]string{
-		"Accept":                           "application/json",
+		"Accept":                           "application/json, text/javascript",
 		"Content-Type":                     "application/json",
 		"X-Apple-OAuth-Client-Id":          s.ClientID,
 		"X-Apple-OAuth-Client-Type":        "firstPartyAuth",
@@ -216,10 +331,13 @@ func (s *Session) GetAuthHeaders(overwrite map[string]string) map[string]string 
 		"X-Apple-OAuth-Response-Type":      "code",
 		"X-Apple-OAuth-State":              s.ClientID,
 		"X-Apple-Widget-Key":               s.ClientID,
-		"Origin":                           homeEndpoint,
-		"Referer":                          fmt.Sprintf("%s/", homeEndpoint),
-		"User-Agent":                       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0",
+		"X-Apple-Frame-Id":                 s.ClientID,
+		"X-Apple-I-FD-Client-Info":         `{"U":"Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0","L":"de","Z":"GMT+01:00","V":"1.1","F":""}`,
+		"Origin":                           idmsaEndpoint,
+		"Referer":                          fmt.Sprintf("%s/", idmsaEndpoint),
+		"User-Agent":                       "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 	}
+	headers["Cookie"] = s.GetCookieString()
 	maps.Copy(headers, overwrite)
 	return headers
 }
@@ -248,7 +366,7 @@ func GetCommonHeaders(overwrite map[string]string) map[string]string {
 		"Content-Type": "application/json",
 		"Origin":       baseEndpoint,
 		"Referer":      fmt.Sprintf("%s/", baseEndpoint),
-		"User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0",
+		"User-Agent":   "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 	}
 	maps.Copy(headers, overwrite)
 	return headers
@@ -285,6 +403,44 @@ func NewSession() *Session {
 	session.srv = rest.NewClient(fshttp.NewClient(context.Background())).SetRoot(baseEndpoint)
 	//session.ClientID = "auth-" + uuid.New().String()
 	return session
+}
+
+// SignInInitResponse is the response of a sign-in init request.
+type SignInInitResponse struct {
+	Iteration int            `json:"iteration"`
+	Salt      string         `json:"salt"`
+	Protocol  SignInProtocol `json:"protocol"`
+	B         string         `json:"b"`
+	C         string         `json:"c"`
+}
+
+type SignInProof struct {
+	C  string
+	M1 []byte
+	M2 []byte
+}
+
+type SignInProtocol string
+
+const (
+	SignInProtocolS2K   SignInProtocol = "s2k"
+	SignInProtocolS2KFO SignInProtocol = "s2k_fo"
+)
+
+func (p SignInProtocol) Valid() bool {
+	return p == SignInProtocolS2K || p == SignInProtocolS2KFO
+}
+
+func (p SignInProtocol) EncodePassword(password string) ([]byte, error) {
+	passHash := sha256.Sum256([]byte(password))
+	switch p {
+	case SignInProtocolS2K:
+		return passHash[:], nil
+	case SignInProtocolS2KFO:
+		return []byte(hex.EncodeToString(passHash[:])), nil
+	default:
+		return nil, fmt.Errorf("unsupported signin protocol: %q", p)
+	}
 }
 
 // AccountInfo represents an account info
