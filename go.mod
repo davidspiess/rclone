@@ -28,6 +28,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6
 	github.com/aws/smithy-go v1.24.0
+	github.com/bodgit/srp v0.0.0-20240503170001-54b7afd45537
 	github.com/buengese/sgzip v0.1.1
 	github.com/cloudinary/cloudinary-go/v2 v2.14.1
 	github.com/cloudsoda/go-smb2 v0.0.0-20250228001242-d4c70e6251cc
